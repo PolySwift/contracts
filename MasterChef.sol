@@ -25,6 +25,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
     struct UserInfo {
         uint256 amount; // How many LP tokens the user has provided.
         uint256 rewardDebt; // Reward debt. See explanation below.
+        uint256 nextHarvestUntil; // When can the user harvest again in seconds
         //
         // We do some fancy math here. Basically, any point in time, the amount of FISHes
         // entitled to a user but is pending to be distributed is:
@@ -45,6 +46,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
         uint256 lastRewardBlock; // Last block number that FISHes distribution occurs.
         uint256 accSwiftPerShare; // Accumulated FISHes per share, times 1e18. See below.
         uint16 depositFeeBP; // Deposit fee in basis points
+        uint256 harvestInterval;  // Harvest interval in seconds
     }
 
     // The SWIFT TOKEN!
@@ -70,7 +72,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
     uint16 public referralCommissionRate = 200;
     // Max referral commission rate: 10%.
     uint16 public constant MAXIMUM_REFERRAL_COMMISSION_RATE = 1000;
-    uint256 constant MAX_SWIFT_SUPPLY = 100000 ether;
+    uint256 public constant MAXIMUM_HARVEST_INTERVAL = 14 days;
 
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
@@ -120,9 +122,12 @@ contract MasterChef is Ownable, ReentrancyGuard {
     function add(
         uint256 _allocPoint,
         IERC20 _lpToken,
-        uint16 _depositFeeBP
+        uint16 _depositFeeBP,
+        uint256 _harvestInterval
     ) external onlyOwner nonDuplicated(_lpToken) {
         require(_depositFeeBP <= 400, "add: invalid deposit fee basis points");
+        require(_harvestInterval <= MAXIMUM_HARVEST_INTERVAL, "add: invalid harvest interval");
+
         uint256 lastRewardBlock = block.number > startBlock
             ? block.number
             : startBlock;
@@ -134,7 +139,8 @@ contract MasterChef is Ownable, ReentrancyGuard {
                 allocPoint: _allocPoint,
                 lastRewardBlock: lastRewardBlock,
                 accSwiftPerShare: 0,
-                depositFeeBP: _depositFeeBP
+                depositFeeBP: _depositFeeBP,
+                harvestInterval: _harvestInterval
             })
         );
     }
@@ -143,14 +149,20 @@ contract MasterChef is Ownable, ReentrancyGuard {
     function set(
         uint256 _pid,
         uint256 _allocPoint,
-        uint16 _depositFeeBP
+        uint16 _depositFeeBP,
+        uint256 _harvestInterval
     ) external onlyOwner {
         require(_depositFeeBP <= 400, "set: invalid deposit fee basis points");
+        require(_harvestInterval <= MAXIMUM_HARVEST_INTERVAL, "set: invalid harvest interval");
+
+        updatePool(_pid);
+
         totalAllocPoint = totalAllocPoint.sub(poolInfo[_pid].allocPoint).add(
             _allocPoint
         );
         poolInfo[_pid].allocPoint = _allocPoint;
         poolInfo[_pid].depositFeeBP = _depositFeeBP;
+        poolInfo[_pid].harvestInterval = _harvestInterval;
     }
 
     // Return reward multiplier over the given _from to _to block.
@@ -214,13 +226,6 @@ contract MasterChef is Ownable, ReentrancyGuard {
             return;
         }
 
-        uint256 currentSupply = swiftToken.totalSupply();
-
-        if (currentSupply >= MAX_SWIFT_SUPPLY) {
-            pool.lastRewardBlock = block.number;
-            return;
-        }
-
         uint256 multiplier = getMultiplier(pool.lastRewardBlock, block.number);
         uint256 swiftReward = multiplier
             .mul(swiftPerBlock)
@@ -234,6 +239,46 @@ contract MasterChef is Ownable, ReentrancyGuard {
             swiftReward.mul(1e18).div(lpSupply)
         );
         pool.lastRewardBlock = block.number;
+    }
+
+    // View function to see if user can fully harvest SWIFT.
+    function canHarvest(uint256 _pid, address _user) public view returns (bool) {
+        UserInfo storage user = userInfo[_pid][_user];
+        return block.timestamp >= user.nextHarvestUntil;
+    }
+
+    // Pay or lockup pending SWIFT.
+    function payOrBurnPendingSwift(uint256 _pid) internal {
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
+
+        if (user.nextHarvestUntil == 0) {
+            user.nextHarvestUntil = block.timestamp.add(pool.harvestInterval);
+        }
+
+        uint256 pending = user.amount.mul(pool.accSwiftPerShare).div(1e18).sub(user.rewardDebt);
+        if (canHarvest(_pid, msg.sender)) {
+            if (pending > 0) {
+                uint256 devReward = pending.div(10);
+
+                // reset lockup
+                user.nextHarvestUntil = block.timestamp.add(pool.harvestInterval);
+
+                // send rewards
+                safeSwiftTransfer(msg.sender, pending.sub(devReward));
+                payReferralCommission(msg.sender, pending.sub(devReward));
+            }
+        } else if (pending > 0) {
+            // User gets 50% of rewards
+            pending = pending.div(2);
+            uint256 devReward = pending.div(10);
+            pending = pending.sub(devReward);
+
+            // send rewards
+            safeSwiftTransfer(msg.sender, pending);
+            payReferralCommission(msg.sender, pending);
+            safeSwiftTransfer(0x000000000000000000000000000000000000dEaD, pending);
+        }
     }
 
     // Deposit LP tokens to MasterChef for SWIFT allocation.
@@ -253,18 +298,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
         ) {
             referral.recordReferral(msg.sender, _referrer);
         }
-        if (user.amount > 0) {
-            uint256 pending = user
-                .amount
-                .mul(pool.accSwiftPerShare)
-                .div(1e18)
-                .sub(user.rewardDebt);
-            if (pending > 0) {
-                uint256 devReward = pending.div(10);
-                safeSwiftTransfer(msg.sender, pending.sub(devReward));
-                payReferralCommission(msg.sender, pending.sub(devReward));
-            }
-        }
+        payOrBurnPendingSwift(_pid);
         if (_amount > 0) {
             pool.lpToken.safeTransferFrom(
                 address(msg.sender),
@@ -298,14 +332,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
 
         require(user.amount >= _amount, "withdraw: not good");
         updatePool(_pid);
-        uint256 pending = user.amount.mul(pool.accSwiftPerShare).div(1e18).sub(
-            user.rewardDebt
-        );
-        if (pending > 0) {
-            uint256 devReward = pending.div(10);
-            safeSwiftTransfer(_user, pending);
-            payReferralCommission(_user, pending.sub(devReward));
-        }
+        payOrBurnPendingSwift(_pid);
         if (_amount > 0) {
             user.amount = user.amount.sub(_amount);
             pool.lpToken.safeTransfer(address(_user), _amount);
